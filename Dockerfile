@@ -100,9 +100,11 @@ RUN groupadd --system zabbix && \
             libldap \
             nc \
             python36 \
+            python36-pip \
             openssl-libs && \
     yum ${YUM_FLAGS_PERSISTENT} clean all && \
     rm -rf /var/cache/yum && \
+    pip3 install qhue py-zabbix python-nest && \
     chmod +x /sbin/tini
 
 EXPOSE 10050/TCP
