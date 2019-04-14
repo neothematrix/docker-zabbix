@@ -30,6 +30,9 @@ ZBX_SERVER_PORT=${ZBX_SERVER_PORT:-"10051"}
 # Default timezone for web interface
 PHP_TZ=${PHP_TZ:-"Europe/Riga"}
 
+#Enable PostgreSQL timescaleDB feature:
+ENABLE_TIMESCALEDB=${ENABLE_TIMESCALEDB:-"false"}
+
 # Default directories
 # User 'zabbix' home directory
 ZABBIX_USER_HOME_DIR="/var/lib/zabbix"
@@ -74,10 +77,10 @@ configure_db_mysql() {
 
         chown -R mysql:mysql "$MYSQL_DATA_DIR"
 
-        echo "** Instaling initial MySQL database schemas"
-        mysql_install_db --user=mysql 2>&1 1>/dev/null
+        echo "** Installing initial MySQL database schemas"
+        mysql_install_db --user=mysql --datadir="$MYSQL_DATA_DIR" 2>&1
     else
-        echo "**** MySQL data directory is not empty. Using already existsing installation."
+        echo "**** MySQL data directory is not empty. Using already existing installation."
         chown -R mysql:mysql "$MYSQL_DATA_DIR"
     fi
 
@@ -256,6 +259,8 @@ check_variables_postgresql() {
     DB_SERVER_ZBX_USER=${POSTGRES_USER:-"zabbix"}
     DB_SERVER_ZBX_PASS=${POSTGRES_PASSWORD:-"zabbix"}
 
+    DB_SERVER_SCHEMA=${DB_SERVER_SCHEMA:-"public"}
+
     if [ "$type" == "proxy" ]; then
         DB_SERVER_DBNAME=${POSTGRES_DB:-"zabbix_proxy"}
     else
@@ -367,7 +372,7 @@ create_db_user_mysql() {
     if [ -z "$USER_EXISTS" ]; then
         mysql_query "CREATE USER '${DB_SERVER_ZBX_USER}'@'%' IDENTIFIED BY '${DB_SERVER_ZBX_PASS}'" 1>/dev/null
     else
-        mysql_query "SET PASSWORD FOR '${DB_SERVER_ZBX_USER}'@'%' = PASSWORD('${DB_SERVER_ZBX_PASS}');" 1>/dev/null
+        mysql_query "ALTER USER ${DB_SERVER_ZBX_USER} IDENTIFIED BY '${DB_SERVER_ZBX_PASS}';" 1>/dev/null
     fi
 
     mysql_query "GRANT ALL PRIVILEGES ON $DB_SERVER_DBNAME. * TO '${DB_SERVER_ZBX_USER}'@'%'" 1>/dev/null
@@ -409,6 +414,8 @@ create_db_database_postgresql() {
     else
         echo "** Database '${DB_SERVER_DBNAME}' already exists. Please be careful with database owner!"
     fi
+
+    psql_query "CREATE SCHEMA IF NOT EXISTS ${DB_SERVER_SCHEMA}"
 }
 
 create_db_schema_mysql() {
@@ -435,15 +442,19 @@ create_db_schema_postgresql() {
     local type=$1
 
     DBVERSION_TABLE_EXISTS=$(psql_query "SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = 
-                                         c.relnamespace WHERE  n.nspname = 'public' AND c.relname = 'dbversion'" "${DB_SERVER_DBNAME}")
+                                         c.relnamespace WHERE  n.nspname = '$DB_SERVER_SCHEMA' AND c.relname = 'dbversion'" "${DB_SERVER_DBNAME}")
 
     if [ -n "${DBVERSION_TABLE_EXISTS}" ]; then
         echo "** Table '${DB_SERVER_DBNAME}.dbversion' already exists."
-        ZBX_DB_VERSION=$(psql_query "SELECT mandatory FROM public.dbversion" "${DB_SERVER_DBNAME}")
+        ZBX_DB_VERSION=$(psql_query "SELECT mandatory FROM ${DB_SERVER_SCHEMA}.dbversion" "${DB_SERVER_DBNAME}")
     fi
 
     if [ -z "${ZBX_DB_VERSION}" ]; then
         echo "** Creating '${DB_SERVER_DBNAME}' schema in PostgreSQL"
+
+        if [ "${ENABLE_TIMESCALEDB}" == "true" ]; then
+            psql_query "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"
+        fi
 
         if [ -n "${DB_SERVER_ZBX_PASS}" ]; then
             export PGPASSWORD="${DB_SERVER_ZBX_PASS}"
@@ -457,6 +468,12 @@ create_db_schema_postgresql() {
         zcat /usr/share/doc/zabbix-$type-postgresql/create.sql.gz | psql -q \
                 -h ${DB_SERVER_HOST} -p ${DB_SERVER_PORT} \
                 -U ${DB_SERVER_ZBX_USER} ${DB_SERVER_DBNAME} 1>/dev/null
+
+        if [ "${ENABLE_TIMESCALEDB}" == "true" ]; then
+            cat /usr/share/doc/zabbix-$type-postgresql/timescaledb.sql | psql -q \
+                -h ${DB_SERVER_HOST} -p ${DB_SERVER_PORT} \
+                -U ${DB_SERVER_ZBX_USER} ${DB_SERVER_DBNAME} 1>/dev/null
+        fi
 
         unset PGPASSWORD
         unset PGOPTIONS
@@ -482,7 +499,10 @@ prepare_web_server_apache() {
     elif [ -f "/etc/apache2/conf.d/default.conf" ]; then
         echo "** Disable default site"
         rm -f "/etc/apache2/conf.d/default.conf"
+    elif [ -f "/etc/httpd/conf.d/welcome.conf" ]; then
+        echo "** Disable default site"
         rm -f "/etc/httpd/conf.d/welcome.conf"
+        rm -f "/etc/httpd/conf.d/ssl.conf"
     fi
 
     echo "** Adding Zabbix virtual host (HTTP)"
@@ -650,10 +670,11 @@ update_zbx_config() {
     fi
 
     if [ $type == "proxy" ] && [ "${ZBX_ADD_SERVER}" = "true" ]; then
-        update_config_var $ZBX_CONFIG "ListenPort" "10061"
+        update_config_var $ZBX_CONFIG "ListenPort" "${ZBX_PROXY_LISTENPORT:-"10061"}"
     else
-        update_config_var $ZBX_CONFIG "ListenPort"
+        update_config_var $ZBX_CONFIG "ListenPort" "${ZBX_LISTENPORT}"
     fi
+
     update_config_var $ZBX_CONFIG "SourceIP" "${ZBX_SOURCEIP}"
     update_config_var $ZBX_CONFIG "LogType" "console"
     update_config_var $ZBX_CONFIG "LogFile"
@@ -823,13 +844,14 @@ prepare_zbx_web_config() {
 
     echo "** Preparing Zabbix frontend configuration file"
 
+    ZBX_WWW_ROOT="/usr/share/zabbix"
     ZBX_WEB_CONFIG="$ZABBIX_ETC_DIR/web/zabbix.conf.php"
 
-    if [ -f "/usr/share/zabbix/conf/zabbix.conf.php" ]; then
-        rm -f "/usr/share/zabbix/conf/zabbix.conf.php"
+    if [ -f "$ZBX_WWW_ROOT/conf/zabbix.conf.php" ]; then
+        rm -f "$ZBX_WWW_ROOT/conf/zabbix.conf.php"
     fi
 
-    ln -s "$ZBX_WEB_CONFIG" "/usr/share/zabbix/conf/zabbix.conf.php"
+    ln -s "$ZBX_WEB_CONFIG" "$ZBX_WWW_ROOT/conf/zabbix.conf.php"
 
     # Different places of PHP configuration file
     if [ -f "/etc/php5/conf.d/99-zabbix.ini" ]; then
@@ -887,6 +909,8 @@ prepare_zbx_web_config() {
     "$ZBX_WEB_CONFIG"
 
     [ "$db_type" = "postgresql" ] && sed -i "s/MYSQL/POSTGRESQL/g" "$ZBX_WEB_CONFIG"
+
+    [ -n "${ZBX_SESSION_NAME}" ] && sed -i "/ZBX_SESSION_NAME/s/'[^']*'/'${ZBX_SESSION_NAME}'/2" "$ZBX_WWW_ROOT/include/defines.inc.php"
 }
 
 prepare_zbx_agent_config() {
@@ -922,7 +946,7 @@ prepare_zbx_agent_config() {
         update_config_var $ZBX_AGENT_CONFIG "Server"
     fi
 
-    update_config_var $ZBX_AGENT_CONFIG "ListenPort"
+    update_config_var $ZBX_AGENT_CONFIG "ListenPort" "${ZBX_LISTENPORT}"
     update_config_var $ZBX_AGENT_CONFIG "ListenIP" "${ZBX_LISTENIP}"
     update_config_var $ZBX_AGENT_CONFIG "StartAgents" "${ZBX_STARTAGENTS}"
 

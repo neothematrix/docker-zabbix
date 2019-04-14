@@ -3,8 +3,8 @@ FROM centos:centos7 as builder
 ARG YUM_FLAGS_COMMON="-y"
 ARG YUM_FLAGS_DEV="${YUM_FLAGS_COMMON}"
 
-ARG MAJOR_VERSION=3.4
-ARG ZBX_VERSION=${MAJOR_VERSION}.13
+ARG MAJOR_VERSION=4.2
+ARG ZBX_VERSION=${MAJOR_VERSION}.0
 ARG ZBX_SOURCES=svn://svn.zabbix.com/tags/${ZBX_VERSION}/
 ENV TERM=xterm ZBX_VERSION=${ZBX_VERSION} ZBX_SOURCES=${ZBX_SOURCES} \
     ZBX_TYPE=agent
@@ -17,8 +17,11 @@ RUN yum --quiet makecache && \
             openssl-devel \
             openldap-devel \
             subversion \
+            git \
+            pcre-devel \
             gcc && \
     cd /tmp/ && \
+    git clone -q https://github.com/monitoringartist/zabbix-docker-monitoring && \
     svn --quiet export ${ZBX_SOURCES} zabbix-${ZBX_VERSION} && \
     cd /tmp/zabbix-${ZBX_VERSION} && \
     zabbix_revision=`set -o pipefail && svn info ${ZBX_SOURCES} | grep "Last Changed Rev"|awk '{print $4;}'` && \
@@ -36,6 +39,9 @@ RUN yum --quiet makecache && \
             --with-openssl \
             --enable-ipv6 \
             --silent && \
+    cp -R /tmp/zabbix-docker-monitoring/src/modules/zabbix_module_docker /tmp/zabbix-${ZBX_VERSION}/src/modules/ && \
+    make -j"$(nproc)" -s && \
+    cd /tmp/zabbix-${ZBX_VERSION}/src/modules/zabbix_module_docker && \
     make -j"$(nproc)" -s
 
 FROM centos:centos7
@@ -47,11 +53,12 @@ ARG VCS_REF
 ARG YUM_FLAGS_COMMON="-y"
 ARG YUM_FLAGS_PERSISTENT="${YUM_FLAGS_COMMON}"
 
-ARG MAJOR_VERSION=3.4
-ARG ZBX_VERSION=${MAJOR_VERSION}.13
+ARG MAJOR_VERSION=4.2
+ARG ZBX_VERSION=${MAJOR_VERSION}.0
 ARG ZBX_SOURCES=svn://svn.zabbix.com/tags/${ZBX_VERSION}/
 ENV TERM=xterm ZBX_VERSION=${ZBX_VERSION} ZBX_SOURCES=${ZBX_SOURCES} \
     ZBX_TYPE=agent ZBX_DB_TYPE=none ZBX_OPT_TYPE=none
+ENV TINI_VERSION v0.18.0
 
 LABEL org.label-schema.name="zabbix-${ZBX_TYPE}-centos" \
       org.label-schema.vendor="Zabbix LLC" \
@@ -71,7 +78,9 @@ STOPSIGNAL SIGTERM
 COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/src/zabbix_agent/zabbix_agentd /usr/sbin/zabbix_agentd
 COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/src/zabbix_get/zabbix_get /usr/bin/zabbix_get
 COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/src/zabbix_sender/zabbix_sender /usr/bin/zabbix_sender
+COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/src/modules/zabbix_module_docker/zabbix_module_docker.so /tmp/zabbix_module_docker.so
 COPY --from=builder  /tmp/zabbix-${ZBX_VERSION}/conf/zabbix_agentd.conf /etc/zabbix/zabbix_agentd.conf
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /sbin/tini
 
 RUN groupadd --system zabbix && \
     adduser -r --shell /sbin/nologin \
@@ -83,6 +92,7 @@ RUN groupadd --system zabbix && \
     mkdir -p /var/lib/zabbix && \
     mkdir -p /var/lib/zabbix/enc && \
     mkdir -p /var/lib/zabbix/modules && \
+    mv /tmp/zabbix_module_docker.so /var/lib/zabbix/modules/zabbix_module_docker.so && \
     chown --quiet -R zabbix:root /var/lib/zabbix && \
     yum ${YUM_FLAGS_COMMON} makecache && \
     yum ${YUM_FLAGS_PERSISTENT} install epel-release && \
@@ -92,15 +102,17 @@ RUN groupadd --system zabbix && \
             python36 \
             openssl-libs && \
     yum ${YUM_FLAGS_PERSISTENT} clean all && \
-    rm -rf /var/cache/yum
+    rm -rf /var/cache/yum && \
+    chmod +x /sbin/tini
 
 EXPOSE 10050/TCP
 
 WORKDIR /var/lib/zabbix
 
-VOLUME ["/etc/zabbix/zabbix_agentd.d", "/var/lib/zabbix/modules"]
+VOLUME ["/etc/zabbix/zabbix_agentd.d"]
 
 COPY ["docker-entrypoint.sh", "/usr/bin/"]
-RUN chmod +x /usr/bin/docker-entrypoint.sh
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["/sbin/tini", "--"]
+
+CMD ["docker-entrypoint.sh"]
